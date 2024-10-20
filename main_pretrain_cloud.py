@@ -1,0 +1,307 @@
+# Copyright (c) Meta Platforms, Inc. and affiliates.
+# All rights reserved.
+
+# This source code is licensed under the license found in the
+# LICENSE file in the root directory of this source tree.
+# --------------------------------------------------------
+# References:
+# DeiT: https://github.com/facebookresearch/deit
+# BEiT: https://github.com/microsoft/unilm/tree/master/beit
+# --------------------------------------------------------
+import argparse
+import datetime
+import json
+import numpy as np
+import os
+import time
+from pathlib import Path
+from PIL import Image
+import torch
+import torch.backends.cudnn as cudnn
+from torch.utils.tensorboard import SummaryWriter
+import torchvision.transforms as transforms
+
+import timm
+
+assert timm.__version__ == "0.3.2"  # version check
+import timm.optim.optim_factory as optim_factory
+import util.misc as misc
+from util.misc import NativeScalerWithGradNormCount as NativeScaler
+import models_mae
+from engine_pretrain import train_one_epoch,evaluate
+
+
+mvtec_all = ['bottle', 'cable', 'capsule', 'carpet', 'grid',
+        'hazelnut', 'leather','metal_nut', 'pill', 'screw',
+        'tile', 'toothbrush', 'transistor','wood', 'zipper']
+object_mvtec = ['bottle', 'cable', 'capsule',
+        'hazelnut', 'metal_nut', 'pill', 'screw',
+        'toothbrush', 'transistor', 'zipper']
+texture_mvtec = ['carpet', 'grid','leather','tile','wood']
+mvtec_single = ['capsule']
+def get_args_parser():
+    parser = argparse.ArgumentParser('shap_warm10_24_mask_ratio0.75_0.25l2_0.5lpips_0.25ssim', add_help=False)
+    parser.add_argument('--batch_size', default=32, type=int,
+                        help='Batch size per GPU (effective batch size is batch_size * accum_iter * # gpus')
+    parser.add_argument('--epochs', default=300, type=int)
+    parser.add_argument('--accum_iter', default=1, type=int,
+                        help='Accumulate gradient iterations (for increasing the effective batch size under memory constraints)')
+    parser.add_argument('--mvtec',default=['bottle', 'cable', 'capsule', 'carpet', 'grid',
+        'hazelnut', 'leather','metal_nut', 'pill', 'screw',
+        'tile', 'toothbrush', 'transistor','wood', 'zipper'],type=list)
+
+    # Model parameters
+    parser.add_argument('--model', default='mae_vit_shap_patch16', type=str, metavar='MODEL',
+                        help='Name of model to train')
+
+    parser.add_argument('--input_size', default=224, type=int,
+                        help='images input size')
+
+    parser.add_argument('--mask_ratio', default=0.75, type=float,
+                        help='Masking ratio (percentage of removed patches).')
+
+    parser.add_argument('--norm_pix_loss', action='store_true',
+                        help='Use (per-patch) normalized pixels as targets for computing loss')
+    parser.set_defaults(norm_pix_loss=False)
+
+    # Optimizer parameters
+    parser.add_argument('--weight_decay', type=float, default=0.05, #todo
+                        help='weight decay (default: 0.05)')
+
+    parser.add_argument('--lr', type=float, default=None, metavar='LR',
+                        help='learning rate (absolute lr)')
+    parser.add_argument('--blr', type=float, default=1e-3, metavar='LR',
+                        help='base learning rate: absolute_lr = base_lr * total_batch_size / 256,1e-3')
+    parser.add_argument('--min_lr', type=float, default=0., metavar='LR',
+                        help='lower lr bound for cyclic schedulers that hit 0')
+
+    parser.add_argument('--warmup_epochs', type=int, default=10, metavar='N',
+                        help='epochs to warmup LR,30')
+
+    # Dataset parameters
+    parser.add_argument('--data_path', default='../ADSHAP/data/MVTec', type=str,
+                        help='dataset path')
+
+    parser.add_argument('--output_dir', default='./q_shap_warm10_24_mask_ratio0.75_resize',
+                        help='path where to save, empty for no saving')
+    parser.add_argument('--log_dir', default='./q_shap_warm10_24_mask_ratio0.75_resize')
+    parser.add_argument('--device', default='cuda',
+                        help='device to use for training / testing')
+    parser.add_argument('--seed', default=0, type=int)
+    parser.add_argument('--resume', default='',
+                        help='resume from checkpoint')
+
+    parser.add_argument('--start_epoch', default=0, type=int, metavar='N',
+                        help='start epoch')
+    parser.add_argument('--num_workers', default=10, type=int) #todo
+    parser.add_argument('--pin_mem', action='store_true',
+                        help='Pin CPU memory in DataLoader for more efficient (sometimes) transfer to GPU.')
+    parser.add_argument('--no_pin_mem', action='store_false', dest='pin_mem')
+    parser.set_defaults(pin_mem=True)
+
+    # distributed training parameters
+    parser.add_argument('--world_size', default=1, type=int,
+                        help='number of distributed processes')
+    parser.add_argument('--local_rank', default=-1, type=int)
+    parser.add_argument('--dist_on_itp', action='store_true')
+    parser.add_argument('--dist_url', default='env://',
+                        help='url used to set up distributed training')
+
+    return parser
+
+
+def init_c(args, DataLoader, model, eps=0.1):# 初始化c
+    device = args.device
+    c = torch.zeros((1,1,768)).to(device)
+    model.eval()
+    n_samples = 0
+    with torch.no_grad():
+        for index, (images, label) in enumerate(DataLoader):
+            # get the inputs of the batch
+            img = images.to(device)
+            _,outputs,_, _= model(img,args.mask_ratio)
+            n_samples += outputs.shape[0]
+            c += torch.sum(outputs, dim=0)
+
+    c /= n_samples
+
+    # If c_i is too close to 0, set to +-eps. Reason: a zero unit can be trivially matched with zero weights.
+    c[(abs(c) < eps) & (c < 0)] = -eps
+    c[(abs(c) < eps) & (c > 0)] = eps
+    return c
+
+
+sig_f = 1
+def init_sigma(args, c, DataLoader, model):
+    device = args.device
+    model.eval()
+    tmp_sigma = torch.tensor(0.0, dtype=torch.float).to(device)
+    n_samples = 0
+    with torch.no_grad():
+        for index, (images, label) in enumerate(DataLoader):
+            img = images.to(device)
+            _,latent_z,_, _= model(img,args.mask_ratio)
+            diff = (latent_z - c) ** 2
+            tmp = torch.sum(diff.detach(), dim=2)
+            if (tmp.mean().detach() / sig_f) < 1:
+                tmp_sigma += 1
+            else:
+                tmp_sigma += tmp.mean().detach() / sig_f
+            n_samples += 1
+    tmp_sigma /= n_samples
+    return tmp_sigma
+
+class MvtecDataLoader_avg(torch.utils.data.Dataset): # train all picture
+    # constructor of the class
+    def __init__(self, mvtec,root_path, transform):
+        self.transform = transform
+        org_images = []
+        for cls in os.listdir(root_path):
+            if cls in mvtec :
+                org_image = [os.path.join(root_path, cls, 'train', 'good', img) for img in
+                             os.listdir(os.path.join(root_path, cls, 'train', 'good'))]
+                org_images.extend(org_image)
+        images = org_images
+        images = sorted(images)
+        self.images = images
+
+    def __getitem__(self, index):
+        image_path = self.images[index]
+        try:
+            label = image_path.split('\\')[-2]
+        except:
+            label = image_path.split('/')[-1]
+        data = Image.open(image_path).convert("RGB")
+        data = self.transform(data)
+        return data, label
+
+    def __len__(self):
+        return len(self.images)
+
+
+
+def main(args):
+    misc.init_distributed_mode(args)
+
+    print('job dir: {}'.format(os.path.dirname(os.path.realpath(__file__))))
+    print("{}".format(args).replace(', ', ',\n'))
+
+    device = torch.device(args.device)
+
+    # fix the seed for reproducibility
+    seed = args.seed + misc.get_rank()
+    torch.manual_seed(seed)
+    np.random.seed(seed)
+
+    cudnn.benchmark = True
+
+    # simple augmentation
+    transform_train = transforms.Compose([
+                    transforms.Resize(224),
+                    transforms.CenterCrop(224),
+                    transforms.RandomHorizontalFlip(),
+                    transforms.RandomVerticalFlip(),
+                    transforms.ToTensor(),
+                    transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
+    ])
+    dataset_train = MvtecDataLoader_avg(args.mvtec,args.data_path,transform=transform_train)
+    print(dataset_train)
+
+    if True:
+        num_tasks = misc.get_world_size()
+        global_rank = misc.get_rank()
+        sampler_train = torch.utils.data.DistributedSampler(
+            dataset_train, num_replicas=num_tasks, rank=global_rank, shuffle=True
+        )
+        print("Sampler_train = %s" % str(sampler_train))
+    else:
+        sampler_train = torch.utils.data.SequentialSampler(dataset_train)
+    if global_rank == 0 and args.log_dir is not None:
+        os.makedirs(args.log_dir, exist_ok=True)
+        log_writer = SummaryWriter(log_dir=args.log_dir)
+    else:
+        log_writer = None
+
+    data_loader_train = torch.utils.data.DataLoader(
+        dataset_train, sampler=sampler_train,
+        batch_size=args.batch_size,
+        num_workers=args.num_workers,
+        pin_memory=args.pin_mem,
+        drop_last=False,
+    )
+    
+    # define the model
+    model = models_mae.__dict__[args.model](norm_pix_loss=args.norm_pix_loss)
+    # checkpoint = torch.load("./shap_warm10_24_mask_ratio0/checkpoint-100.pth", map_location='cpu')
+    # checkpoint_model = checkpoint['model']
+    # model.load_state_dict(checkpoint_model, strict=False)
+    # print('load model ok')
+    model.to(device)
+
+    model_without_ddp = model
+    print("Model = %s" % str(model_without_ddp))
+
+    eff_batch_size = args.batch_size * args.accum_iter * misc.get_world_size()
+    
+    if args.lr is None:  # only base_lr is specified
+        args.lr = args.blr * eff_batch_size / 256
+
+    print("base lr: %.2e" % (args.lr * 256 / eff_batch_size))
+    print("actual lr: %.2e" % args.lr)
+
+    print("accumulate grad iterations: %d" % args.accum_iter)
+    print("effective batch size: %d" % eff_batch_size)
+    
+    # following timm: set wd as 0 for bias and norm layers
+    param_groups = optim_factory.add_weight_decay(model_without_ddp, args.weight_decay)
+    optimizer = torch.optim.AdamW(param_groups, lr=args.lr, betas=(0.9, 0.95)) #todo
+    print(optimizer)
+    loss_scaler = NativeScaler()
+
+    misc.load_model(args=args, model_without_ddp=model_without_ddp, optimizer=optimizer, loss_scaler=loss_scaler)
+
+    print(f"Start training for {args.epochs} epochs")
+    start_time = time.time()
+    # model.c = init_c(args, data_loader_train, model)
+    # model.sigma = init_sigma(args, model.c, data_loader_train, model)
+    # print('init ok')
+    for epoch in range(args.start_epoch, args.epochs):
+        if args.output_dir and (epoch !=0 and epoch % 20 == 0 or epoch + 1 == args.epochs):
+            auc_file = open(args.output_dir + "/auc.txt", "a")
+            evaluate(args, model, device,epoch,auc_file)
+            auc_file.close()
+        train_stats = train_one_epoch(
+            model, data_loader_train,
+            optimizer, device, epoch, loss_scaler,
+            log_writer=log_writer,
+            args=args
+        )
+        # if epoch % 10 == 0 and epoch != 0:
+        #     model.c = init_c(args, data_loader_train, model)
+        #     model.sigma = init_sigma(args, model.c, data_loader_train, model)
+        #     print('init ok!')
+        if args.output_dir and (epoch % 50 == 0 or epoch + 1 == args.epochs):
+            misc.save_model(
+                args=args, model=model, model_without_ddp=model_without_ddp, optimizer=optimizer,
+                loss_scaler=loss_scaler, epoch=epoch)
+
+        log_stats = {**{f'train_{k}': v for k, v in train_stats.items()},
+                        'epoch': epoch,}
+
+        if args.output_dir and misc.is_main_process():
+            if log_writer is not None:
+                log_writer.flush()
+            with open(os.path.join(args.output_dir, "log.txt"), mode="a", encoding="utf-8") as f:
+                f.write(json.dumps(log_stats) + "\n")
+
+    total_time = time.time() - start_time
+    total_time_str = str(datetime.timedelta(seconds=int(total_time)))
+    print('Training time {}'.format(total_time_str))
+
+
+if __name__ == '__main__':
+    args = get_args_parser()
+    args = args.parse_args()
+    if args.output_dir:
+        Path(args.output_dir).mkdir(parents=True, exist_ok=True)
+    main(args)
